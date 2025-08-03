@@ -36,16 +36,21 @@ class ScriptType(Enum):
     PYTHON = "py"
     BASH = "sh"
     POWERSHELL = "ps1"
+    NODE = "js"
 
     @classmethod
-    def from_suffix(cls, suffix: str) -> "ScriptType":
-        try:
-            return cls(suffix.lstrip("."))
-        except ValueError as e:
-            raise ValueError(f"Unsupported script type: {suffix}") from e
+    def _javascript_aliases(cls) -> set[str]:
+        return {"ts", "jsx", "cjs", "mjs"}
 
-    def __str__(self) -> str:
-        return str(self.name).title()
+    @classmethod
+    def from_suffix(cls, file: Path) -> "ScriptType":
+        suffix = file.suffix.lstrip(".")
+        if suffix in cls._javascript_aliases():
+            return cls.NODE
+        try:
+            return cls(suffix)
+        except ValueError as e:
+            raise ValueError(f"Unsupported script type: {file.suffix}") from e
 
 
 class ScriptRunner:
@@ -62,15 +67,21 @@ class ScriptRunner:
 
     extensions = [".py", ".sh", ".ps1"]
 
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, sandbox: bool) -> None:
         """Initialize the MCP server.
         Methods are registered as tools with the @register_tool decorator
         and added to FastMCP Tools on initialization.
 
         Args:
             directory: Directory containing scripts to execute.
+            sandbox: Whether to run scripts in a sandbox by default.
         """
         self._directory = directory
+        self._sandbox = sandbox
+
+        self._sandbox_image_name = "script-runner-sandbox"
+        self._sandbox_image_checked = False
+
         self._win32 = sys.platform == "win32"
         self._mcp = FastMCP(
             "Script Runner",
@@ -81,6 +92,32 @@ class ScriptRunner:
     def _add_tools(self, tools: list[Callable]) -> None:
         for tool in tools:
             self._mcp.add_tool(tool)
+
+    async def _build_sandbox_image(self) -> None:
+        """Check and build the sandbox docker image if it doesn't exist."""
+        dockerfile_dir = str(Path(__file__).parent.expanduser().resolve())
+        build_command = self._build_docker_build_command(dockerfile_dir)
+        inspect_output = await self._execute_command(
+            build_command,
+        )
+        self._sandbox_image_checked = True
+
+        if not inspect_output.startswith("Error"):
+            return
+
+        build_command = [
+            "docker",
+            "build",
+            "-t",
+            self._sandbox_image_name,
+            dockerfile_dir,
+        ]
+        build_response = await self._execute_command(build_command)
+        if build_response.startswith("Error"):
+            print(
+                f"Failed to build sandbox image: {build_response}",
+                file=sys.stderr,
+            )
 
     def _find_script(self, script_name: str, directory: str | None) -> Path:
         """
@@ -142,14 +179,14 @@ class ScriptRunner:
         except Exception as e:
             return f"Error executing script: {e}"
 
-    def _get_executor(self, suffix: str) -> list[str]:
+    def _get_executor(self, script_file: Path, sandbox: bool) -> list[str]:
         """
         Determine the appropriate executor command for a script based on its extension.
 
         Returns:
             list[str] The shell execution command
         """
-        script_type = ScriptType.from_suffix(suffix)
+        script_type = ScriptType.from_suffix(script_file)
 
         match script_type:
             case ScriptType.POWERSHELL:
@@ -160,39 +197,82 @@ class ScriptRunner:
                         "Bypass",
                         "-File",
                     ]
-                    if self._win32
+                    if self._win32 and not sandbox
                     else ["pwsh", "-File"]
                 )
             case ScriptType.PYTHON:
                 return ["uv", "run"]
             case ScriptType.BASH:
+                if self._win32 and not sandbox:
+                    raise ValueError(
+                        "Bash scripts can only be run in a sandbox on Windows."
+                    )
                 return ["bash"]
+            case ScriptType.NODE:
+                return ["npm", "run"]
             case _:
                 raise ValueError(f"Unsupported script type: {script_type}")
 
-    def _is_pwsh_help(self, args: list[str], suffix: str) -> bool:
+    def _is_pwsh_help(self, args: list[str], script_file: Path) -> bool:
         """Determine if the command is for PowerShell help."""
         return (
             args == ["-h"]
-            and ScriptType.from_suffix(suffix) == ScriptType.POWERSHELL
+            and ScriptType.from_suffix(script_file) == ScriptType.POWERSHELL
         )
 
-    def _build_pwsh_help_command(self, script_path: Path) -> list[str]:
+    def _build_pwsh_help_command(
+        self, script_path: Path, sandbox: bool
+    ) -> list[str]:
         """Build the PowerShell help command."""
-        shell = "powershell" if self._win32 else "pwsh"
+        shell = "powershell" if self._win32 and not sandbox else "pwsh"
         return [shell, "help", str(script_path)]
 
-    def _build_command(
-        self, script_name: str, args: list[str], directory: str | None
+    def _build_docker_build_command(self, dockerfile_dir: str) -> list[str]:
+        return [
+            "docker",
+            "build",
+            "-t",
+            self._sandbox_image_name,
+            dockerfile_dir,
+        ]
+
+    async def _build_docker_run_command(self, script_dir: Path) -> list[str]:
+        """Build the Docker run command."""
+        if not self._sandbox_image_checked:
+            await self._build_sandbox_image()
+
+        return [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{script_dir}:app",
+            "-w",
+            "app",
+            self._sandbox_image_name,
+        ]
+
+    async def _build_command(
+        self,
+        script_name: str,
+        args: list[str],
+        directory: str | None,
+        sandbox: bool,
     ) -> list[str]:
+        use_sandbox = sandbox or self._sandbox
+
         script_path: Path = self._find_script(script_name, directory)
-        suffix = script_path.suffix
 
-        if self._is_pwsh_help(args, suffix):
-            return self._build_pwsh_help_command(script_path)
-
-        command_base: list[str] = self._get_executor(suffix)
-        return command_base + [str(script_path)] + args
+        command_base: list[str] = (
+            self._build_pwsh_help_command(script_path, use_sandbox)
+            if self._is_pwsh_help(args, script_path)
+            else self._get_executor(script_path, use_sandbox)
+        )
+        command = (
+            await self._build_docker_run_command(script_path) if use_sandbox else []
+        )
+        command.extend(command_base)
+        return command + [str(script_path)] + args
 
     def _resolve_directory(self, directory: str | None) -> Path:
         """Resolve the directory path to use."""
@@ -200,22 +280,28 @@ class ScriptRunner:
 
     @register_tool
     async def call_help(
-        self, script_name: str, directory: str | None = None
+        self,
+        script_name: str,
+        directory: str | None = None,
+        sandbox: bool = False,
     ) -> str:
         """
         Call a script with the -h flag to get help information.
         This tool should be called first to understand how to use the script.
 
         Args:
-            script_name: Name of the script to call (with or without extension)
-            directory: Optional directory path. If not provided, uses the server's configured directory.
+            script_name: Name of the script to call.
+            directory: Optional directory path. If not provided, uses the
+                server's configured directory or the current directory.
+            sandbox: Optional flag to determine if the script should be
+                executed in a sandbox.
 
         Returns:
             Help output from the script (simulated)
         """
         try:
-            command: list[str] = self._build_command(
-                script_name, ["-h"], directory
+            command: list[str] = await self._build_command(
+                script_name, ["-h"], directory, sandbox
             )
             return await self._execute_command(command)
 
@@ -230,15 +316,19 @@ class ScriptRunner:
         script_name: str,
         args: list[str] | None = None,
         directory: str | None = None,
+        sandbox: bool = False,
     ) -> str:
         """
         Execute a script with the provided arguments.
         Call call_help first to understand the script's usage.
 
         Args:
-            script_name: Name of the script to call (with or without extension)
-            args: List of arguments to pass to the script (excluding -h)
-            directory: Optional directory path. If not provided, uses the server's configured directory.
+            script_name: Name of the script to call.
+            args: List of arguments to pass to the script.
+            directory: Optional directory path. If not provided, uses the
+                server's configured directory or the current directory.
+            sandbox: Optional flag to determine if the script should be
+                executed in a sandbox.
 
         Returns:
             Output from the script execution (simulated)
@@ -246,8 +336,8 @@ class ScriptRunner:
         try:
             if not args:
                 args = []
-            command: list[str] = self._build_command(
-                script_name, args, directory
+            command: list[str] = await self._build_command(
+                script_name, args, directory, sandbox
             )
             return await self._execute_command(command)
 
@@ -313,7 +403,7 @@ class ScriptRunner:
         """
         try:
             file = self._find_script(script_name, directory)
-            script_type = ScriptType(file.suffix)
+            script_type = ScriptType.from_suffix(file)
             return f"Script '{script_name}' found in {directory}. Script type: {str(script_type).title()}"
         except (FileNotFoundError, ValueError) as e:
             return str(e)
@@ -328,16 +418,23 @@ def main():
 
     parser = argparse.ArgumentParser(description="Script Runner MCP Server")
     parser.add_argument(
-        "--directory",
+        "--dir",
         "-d",
         type=str,
         help="Default directory containing scripts to execute",
         default=".",
     )
 
+    parser.add_argument(
+        "--sandbox",
+        "-s",
+        action="store_true",
+        help="Run script in sandbox mode",
+    )
+
     args = parser.parse_args()
 
-    _script_dir = resolve_path(args.directory)
+    _script_dir = resolve_path(args.dir)
     if not _script_dir.exists() or not _script_dir.is_dir():
         print(
             f"❌ Error: Directory '{_script_dir}' does not exist.",
@@ -345,7 +442,7 @@ def main():
         )
         sys.exit(1)
 
-    runner = ScriptRunner(_script_dir)
+    runner = ScriptRunner(directory=_script_dir, sandbox=args.sandbox)
     runner.run()
 
 
