@@ -3,6 +3,7 @@
 .qodo/
 .env/
 .env
+.vscode/
 
 # Virtual environment
 .venv/
