@@ -52,6 +52,9 @@ class ScriptType(Enum):
         except ValueError as e:
             raise ValueError(f"Unsupported script type: {file.suffix}") from e
 
+    def __str__(self) -> str:
+        return self.name.title()
+
 
 class ScriptRunner:
     """Script Runner MCP Server.
@@ -85,7 +88,10 @@ class ScriptRunner:
         self._win32 = sys.platform == "win32"
         self._mcp = FastMCP(
             "Script Runner",
-            instructions="Use the 'call_help' tool to learn how to use an available script.",
+            instructions=(
+                "Use the 'call_help' tool to learn how to use an available "
+                "script."
+            ),
         )
         self._add_tools(self._tools)
 
@@ -181,7 +187,7 @@ class ScriptRunner:
 
     def _get_executor(self, script_file: Path, sandbox: bool) -> list[str]:
         """
-        Determine the appropriate executor command for a script based on its extension.
+        Find the appropriate execution command for a script based on extension.
 
         Returns:
             list[str] The shell execution command
@@ -269,7 +275,9 @@ class ScriptRunner:
             else self._get_executor(script_path, use_sandbox)
         )
         command = (
-            await self._build_docker_run_command(script_path) if use_sandbox else []
+            await self._build_docker_run_command(script_path)
+            if use_sandbox
+            else []
         )
         command.extend(command_base)
         return command + [str(script_path)] + args
@@ -352,7 +360,8 @@ class ScriptRunner:
         List available scripts in the specified directory.
 
         Args:
-            directory: Optional directory path. If not provided, uses the server's configured directory.
+            directory: Optional directory path. If not provided, uses the
+                server's configured directory.
 
         Returns:
             List of available scripts in the directory.
@@ -404,7 +413,10 @@ class ScriptRunner:
         try:
             file = self._find_script(script_name, directory)
             script_type = ScriptType.from_suffix(file)
-            return f"Script '{script_name}' found in {directory}. Script type: {str(script_type).title()}"
+            return (
+                f"Script '{script_name}' found in {directory}. "
+                f"Script type: {str(script_type)}"
+            )
         except (FileNotFoundError, ValueError) as e:
             return str(e)
 
