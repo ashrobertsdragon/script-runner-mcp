@@ -37,6 +37,7 @@ class ScriptType(Enum):
     BASH = "sh"
     POWERSHELL = "ps1"
     NODE = "js"
+    UNKNOWN = ""
 
     @classmethod
     def _javascript_aliases(cls) -> set[str]:
@@ -124,6 +125,7 @@ class ScriptRunner:
                 f"Failed to build sandbox image: {build_response}",
                 file=sys.stderr,
             )
+            sys.exit(1)
 
     def _find_script(self, script_name: str, directory: str | None) -> Path:
         """
@@ -145,9 +147,6 @@ class ScriptRunner:
             return exact_path
 
         for ext in self.extensions:
-            if self._win32 and ext == ".sh":
-                continue
-
             script_path: Path = script_dir / f"{script_name}{ext}"
             if script_path.exists():
                 return script_path
@@ -185,6 +184,40 @@ class ScriptRunner:
         except Exception as e:
             return f"Error executing script: {e}"
 
+    @staticmethod
+    def _split_shebang(shebang: str) -> str:
+        """Get the last token from the shebang line."""
+        last_token = shebang.strip().split(" ")[-1]
+        return last_token.split("/")[-1]
+
+    @staticmethod
+    def _read_first_line(script_file: Path) -> str:
+        with script_file.open("r") as file:
+            return file.readline().strip()
+
+    def _check_shebang(self, script_file: Path) -> ScriptType:
+        """Check the script type based on the shebang line."""
+        shebangs: dict[str, ScriptType] = {
+            "#!/usr/bin/env python": ScriptType.PYTHON,
+            "#!/usr/bin/python3": ScriptType.PYTHON,
+            "#!/usr/bin/python": ScriptType.PYTHON,
+            "#!/usr/bin/env -S uv run --script": ScriptType.PYTHON,
+            "#!/bin/bash": ScriptType.BASH,
+            "#!/bin/sh": ScriptType.BASH,
+            "#!/usr/bin/env pwsh": ScriptType.POWERSHELL,
+            "#!/usr/bin/env node": ScriptType.NODE,
+        }
+        first_line = self._read_first_line(script_file)
+        try:
+            return shebangs[first_line]
+        except KeyError as e:
+            if first_line.startswith("#!"):
+                script_type = self._split_shebang(first_line)
+                raise ValueError(
+                    f"Unsupported script type: {script_type}"
+                ) from e
+            return ScriptType.UNKNOWN
+
     def _get_executor(self, script_file: Path, sandbox: bool) -> list[str]:
         """
         Find the appropriate execution command for a script based on extension.
@@ -193,6 +226,8 @@ class ScriptRunner:
             list[str] The shell execution command
         """
         script_type = ScriptType.from_suffix(script_file)
+        if script_type == ScriptType.UNKNOWN:
+            script_type = self._check_shebang(script_file)
 
         match script_type:
             case ScriptType.POWERSHELL:
@@ -219,12 +254,12 @@ class ScriptRunner:
             case _:
                 raise ValueError(f"Unsupported script type: {script_type}")
 
+    def _is_powershell(self, script_file: Path) -> bool:
+        return ScriptType.from_suffix(script_file) == ScriptType.POWERSHELL
+
     def _is_pwsh_help(self, args: list[str], script_file: Path) -> bool:
         """Determine if the command is for PowerShell help."""
-        return (
-            args == ["-h"]
-            and ScriptType.from_suffix(script_file) == ScriptType.POWERSHELL
-        )
+        return args == ["-h"] and self._is_powershell(script_file)
 
     def _build_pwsh_help_command(
         self, script_path: Path, sandbox: bool
@@ -286,6 +321,18 @@ class ScriptRunner:
         """Resolve the directory path to use."""
         return resolve_path(directory) if directory else self._directory
 
+    def _verify_help_flag(
+        self, script_name: str, directory: str | None
+    ) -> bool:
+        script_path = self._find_script(script_name, directory)
+        content = self.read_script(script_name, directory)
+        return (
+            "-h" in content
+            or "-help" in content
+            or self._is_powershell(script_path)
+            and ".PARAMETER" in content
+        )
+
     @register_tool
     async def call_help(
         self,
@@ -308,6 +355,10 @@ class ScriptRunner:
             Help output from the script (simulated)
         """
         try:
+            if not self._verify_help_flag(script_name, directory):
+                return (
+                    f"Error: Script {script_name} does not have help command."
+                )
             command: list[str] = await self._build_command(
                 script_name, ["-h"], directory, sandbox
             )
